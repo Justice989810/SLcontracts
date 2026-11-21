@@ -314,6 +314,65 @@ fn test_approve_already_active_course() {
     client.approve_course(&admin, &course_id); // second approve — should panic
 }
 
+#[test]
+#[should_panic(expected = "course review period has not elapsed")]
+fn test_approve_course_blocked_before_min_review_delay_elapses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Require a review delay of 100 ledgers between course registration
+    // and approval.
+    client.update_min_review_delay(&admin, &100u32);
+
+    let course_id = String::from_str(&env, "COURSE-REVIEW-DELAY-001");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    // Only 1 ledger has elapsed since registration — far short of the
+    // 100-ledger minimum review delay, so approval must be rejected.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    client.approve_course(&admin, &course_id);
+}
+
+#[test]
+fn test_approve_course_succeeds_after_min_review_delay_elapses() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_min_review_delay(&admin, &100u32);
+
+    let course_id = String::from_str(&env, "COURSE-REVIEW-DELAY-002");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &50_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    // Advance past the min review delay before approving.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 101;
+    });
+    client.approve_course(&admin, &course_id);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Active);
+}
+
 // ============================================================
 // ENROLLMENT & PAYMENT TESTS
 // ============================================================
@@ -799,6 +858,68 @@ fn test_enroll_pending_course() {
     );
 
     client.enroll(&student, &String::from_str(&env, "COURSE-PENDING"));
+}
+
+#[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_enroll_rejected_course() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-REJECTED-001");
+    client.register_course(
+        &instructor,
+        &course_id,
+        &500_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    client.reject_course(&admin, &course_id, &String::from_str(&env, "low quality"));
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Rejected);
+
+    // A Rejected course must never accept enrollments.
+    client.enroll(&student, &course_id);
+}
+
+#[test]
+#[should_panic(expected = "course is not available for enrollment")]
+fn test_enroll_archived_course() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let course_id = String::from_str(&env, "COURSE-ARCHIVED-001");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVED-001",
+        500_000_000,
+    );
+
+    // archive_course requires the course to be Paused first, with no
+    // active enrollments remaining.
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Archived);
+
+    // An Archived course must never accept enrollments.
+    client.enroll(&student, &course_id);
 }
 
 #[test]
@@ -3002,6 +3123,73 @@ fn test_add_approved_token_unauthorized_includes_operation() {
 
     // Instructor tries to add approved token — should panic with operation name
     client.add_approved_token(&instructor, &new_token);
+}
+
+#[test]
+fn test_add_approved_token_allows_enrollment_with_new_token() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Deploy a second, standard-conforming SAC token that is not yet approved.
+    let new_token_admin = Address::generate(&env);
+    let new_token_id = env
+        .register_stellar_asset_contract_v2(new_token_admin.clone())
+        .address();
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &new_token_id).mint(&student, &100_000_000_000);
+
+    client.add_approved_token(&admin, &new_token_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &new_token_id,
+        &admin,
+        &instructor,
+        "COURSE-NEW-TOKEN-001",
+        50_000_000,
+    );
+
+    // Enrollment succeeds now that the token is on the whitelist.
+    client.enroll(&student, &String::from_str(&env, "COURSE-NEW-TOKEN-001"));
+    assert!(client.is_enrolled(&student, &String::from_str(&env, "COURSE-NEW-TOKEN-001")));
+}
+
+#[test]
+#[should_panic(expected = "course token is not approved")]
+fn test_remove_approved_token_blocks_new_enrollment() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REMOVE-TOKEN-001",
+        50_000_000,
+    );
+
+    client.remove_approved_token(&admin, &token_id);
+
+    // Token is no longer whitelisted, so enrollment must be rejected even
+    // though the course itself is still Active.
+    client.enroll(&student, &String::from_str(&env, "COURSE-REMOVE-TOKEN-001"));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: remove_approved_token")]
+fn test_remove_approved_token_unauthorized_includes_operation() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Instructor (not admin) tries to remove an approved token.
+    client.remove_approved_token(&instructor, &token_id);
 }
 
 #[test]
