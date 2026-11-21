@@ -14405,3 +14405,239 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// COURSE_REGISTERED EVENT PAYLOAD TESTS (#325)
+// ============================================================
+
+/// #325 — register_course() must emit a `course_registered` event whose
+/// topic carries the new course_id and whose payload is the same course_id.
+#[test]
+fn test_course_registered_event_payload() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id = client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-EVT-325"),
+        &100_000_000i128,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+
+    let events = env.events().all();
+    let mut matched = 0u32;
+
+    for (contract, topics, data) in events.iter() {
+        if contract != contract_id {
+            continue;
+        }
+
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic0 != Symbol::new(&env, "course_registered") {
+            continue;
+        }
+
+        matched += 1;
+
+        // Topic 1 carries the course_id.
+        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_course_id, course_id);
+
+        // Payload is the course_id too.
+        let payload_course_id: String = data.try_into_val(&env).unwrap();
+        assert_eq!(payload_course_id, course_id);
+    }
+
+    assert_eq!(matched, 1, "expected exactly one course_registered event");
+}
+
+// ============================================================
+// DISPUTE_ESCALATED EVENT PAYLOAD TESTS (#324)
+// ============================================================
+
+/// #324 — escalate_to_arbitration() must emit a `dispute_escalated` event
+/// whose topic carries the course_id and whose payload is
+/// (caller, course_id, fee_per_case).
+#[test]
+fn test_dispute_escalated_event_payload() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let course_id_str = "COURSE-ARB-324";
+    client.set_arbitration_fee_config(&admin, &fee_per_case);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        1_000_000_000,
+    );
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+    let course_id = String::from_str(&env, course_id_str);
+    client.enroll(&student, &course_id);
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let events = env.events().all();
+    let mut matched = 0u32;
+
+    for (contract, topics, data) in events.iter() {
+        if contract != contract_id {
+            continue;
+        }
+
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic0 != Symbol::new(&env, "dispute_escalated") {
+            continue;
+        }
+
+        matched += 1;
+
+        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic_course_id, course_id);
+
+        let (event_caller, event_course_id, event_fee): (Address, String, i128) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(event_caller, student);
+        assert_eq!(event_course_id, course_id);
+        assert_eq!(event_fee, fee_per_case);
+    }
+
+    assert_eq!(matched, 1, "expected exactly one dispute_escalated event");
+}
+
+// ============================================================
+// MAX_CERTIFICATES CAP ENFORCEMENT TESTS (#321)
+// ============================================================
+
+/// #321 — issue_certificate() must allow issuance up to max_certificates
+/// and panic once the cap is reached.
+#[test]
+#[should_panic(expected = "course has reached maximum certificate issuance limit")]
+fn test_issue_certificate_enforces_max_certificates_cap() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-CAP-321";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+
+    // Cap the course to exactly one certificate.
+    client.set_max_certificates(&admin, &course_id, &Some(1u32));
+
+    let student_one = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_one,
+        course_id_str,
+        "CERT-CAP-321-A",
+    );
+
+    // First issuance succeeds and consumes the only slot.
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.certificates_issued, 1);
+    assert_eq!(course.max_certificates, Some(1u32));
+
+    // Second issuance for a different student must panic: the cap is reached.
+    let student_two = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_two,
+        course_id_str,
+        "CERT-CAP-321-B",
+    );
+}
+
+// ============================================================
+// COURSECERTIFICATES INDEX GROWTH TESTS (#320)
+// ============================================================
+
+/// #320 — the CourseCertificates index must grow by one entry per
+/// certificate issued for a course, in issuance order.
+#[test]
+fn test_course_certificates_index_grows_per_issuance() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-IDX-320";
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, course_id_str);
+
+    assert_eq!(client.get_course_certificates(&course_id).len(), 0);
+
+    let student_one = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_one,
+        course_id_str,
+        "CERT-IDX-320-A",
+    );
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+    assert_eq!(
+        client.get_course_certificates(&course_id).get(0).unwrap(),
+        String::from_str(&env, "CERT-IDX-320-A")
+    );
+
+    let student_two = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_two,
+        course_id_str,
+        "CERT-IDX-320-B",
+    );
+    assert_eq!(client.get_course_certificates(&course_id).len(), 2);
+    assert_eq!(
+        client.get_course_certificates(&course_id).get(1).unwrap(),
+        String::from_str(&env, "CERT-IDX-320-B")
+    );
+
+    let student_three = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student_three,
+        course_id_str,
+        "CERT-IDX-320-C",
+    );
+    let final_index = client.get_course_certificates(&course_id);
+    assert_eq!(final_index.len(), 3);
+    assert_eq!(final_index.get(2).unwrap(), String::from_str(&env, "CERT-IDX-320-C"));
+}
