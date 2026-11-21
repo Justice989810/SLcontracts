@@ -1898,6 +1898,55 @@ fn test_update_treasury_same_address_rejected() {
 }
 
 // ============================================================
+// ISSUE #298 — update_treasury requires both admin signatures
+// ============================================================
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_update_treasury_rejects_single_admin_signing_twice() {
+    // Passing the same admin address for both signer slots must be rejected —
+    // a single admin cannot satisfy the two-signature requirement alone.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let new_treasury = Address::generate(&env);
+    client.update_treasury(&admin, &admin, &new_treasury);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_update_treasury_rejects_non_admin_second_signer() {
+    // The second signer must be the registered SecondaryAdmin — an arbitrary
+    // address (even though it signs via mock_all_auths) must be rejected.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let not_an_admin = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    client.update_treasury(&admin, &not_an_admin, &new_treasury);
+}
+
+#[test]
+fn test_update_treasury_accepts_both_admin_signatures_either_order() {
+    // Both valid orderings of (Admin, SecondaryAdmin) must be accepted.
+    let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // (admin, sec_admin) order
+    let new_treasury_1 = Address::generate(&env);
+    client.update_treasury(&admin, &sec_admin, &new_treasury_1);
+
+    // Advance past the pending-update delay so a fresh update can be queued cleanly.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 200;
+    });
+
+    // (sec_admin, admin) order — reversed, must also be accepted
+    let new_treasury_2 = Address::generate(&env);
+    client.update_treasury(&sec_admin, &admin, &new_treasury_2);
+}
+
+// ============================================================
 // INPUT LENGTH VALIDATION TESTS (#20)
 // ============================================================
 
@@ -4791,6 +4840,87 @@ fn test_events_emitted_for_admin_operations() {
     assert_eq!(event_dest, destination);
 }
 
+// ============================================================
+// ISSUE #305 — re_enroll after refund
+// ============================================================
+
+#[test]
+#[should_panic(expected = "no prior enrollment found for this course")]
+fn test_re_enroll_after_approved_refund_fails() {
+    // Once an admin approves a refund, process_refund() archives the
+    // enrollment to history and removes the active Enrollment record
+    // entirely. re_enroll() looks up that active record (and additionally
+    // requires it be `completed`), so after a refund there is nothing left
+    // to re-enroll against — it must panic the same way a student with no
+    // prior enrollment at all would.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REENROLL-REFUND",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-REENROLL-REFUND");
+
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+    client.process_refund(&admin, &student, &course_id, &true);
+
+    // No active enrollment remains — re_enroll must fail.
+    client.re_enroll(&student, &course_id);
+}
+
+#[test]
+fn test_re_enroll_after_rejected_refund_still_requires_completion() {
+    // A *rejected* refund leaves the original (uncompleted) enrollment
+    // record intact. re_enroll() still requires that record to be
+    // `completed`, so it must panic with the completion guard, not the
+    // "no prior enrollment" guard — proving the rejected-refund enrollment
+    // was preserved rather than silently cleared.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REENROLL-REFUND-REJ",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-REENROLL-REFUND-REJ");
+
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+    client.process_refund(&admin, &student, &course_id, &false);
+
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(!enrollment.completed);
+    assert!(!enrollment.is_refunded);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.re_enroll(&student, &course_id);
+    }));
+    assert!(
+        result.is_err(),
+        "re_enroll must still fail while the original enrollment is not completed"
+    );
+}
+
 #[test]
 #[should_panic(expected = "no prior enrollment found for this course")]
 fn test_re_enroll_without_prior_enrollment_fails() {
@@ -6395,6 +6525,64 @@ fn test_refund_window_zero_rejects_all_requests() {
         result.is_err(),
         "window=0 should reject any refund request after enrollment ledger"
     );
+}
+
+// ============================================================
+// ISSUE #306 — refund boundary: within vs outside refund_window_ledgers
+// ============================================================
+
+#[test]
+fn test_refund_boundary_within_vs_outside_refund_window_ledgers() {
+    // Exercises both sides of the refund_window_ledgers boundary against two
+    // independent enrollments under the same admin-configured window, so the
+    // "within" and "outside" outcomes are verified in a single scenario.
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let asset_client = token::StellarAssetClient::new(&env, &token_id);
+
+    let window = 50u32;
+    client.update_refund_window(&admin, &window);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-BOUNDARY-306",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-BOUNDARY-306");
+
+    // --- Student A: requests refund WITHIN the window ---
+    let student_a = Address::generate(&env);
+    asset_client.mint(&student_a, &1_000_000_000);
+    client.enroll(&student_a, &course_id);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number += window - 1; // elapsed < window
+    });
+    client.request_refund(&student_a, &course_id);
+    let request_a = client.get_refund_request(&student_a, &course_id).unwrap();
+    assert_eq!(request_a.status, RefundStatus::Pending);
+
+    // --- Student B: requests refund OUTSIDE the window (same course/window) ---
+    let student_b = Address::generate(&env);
+    asset_client.mint(&student_b, &1_000_000_000);
+    client.enroll(&student_b, &course_id);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number += window + 1; // elapsed > window
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.request_refund(&student_b, &course_id);
+    }));
+    assert!(
+        result.is_err(),
+        "a refund request submitted outside refund_window_ledgers must be rejected"
+    );
+    // The outside-window attempt must not have created a request record.
+    assert!(client.get_refund_request(&student_b, &course_id).is_none());
 }
 
 // ============================================================
@@ -10414,6 +10602,40 @@ fn test_update_default_fee_accepts_different_value() {
     let client = SorobanLardContractClient::new(&env, &contract_id);
     client.update_default_fee(&admin, &15u32);
     client.update_default_fee(&admin, &25u32);
+}
+
+// ============================================================
+// ISSUE #299 — update_default_fee percentage boundary values
+// ============================================================
+
+#[test]
+fn test_update_default_fee_accepts_zero_boundary() {
+    // 0% is a valid fee percentage (the lower boundary) and must be accepted.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_default_fee(&admin, &0u32);
+    assert_eq!(client.get_platform_fee(&admin), 0u32);
+}
+
+#[test]
+fn test_update_default_fee_accepts_hundred_boundary() {
+    // 100% is a valid fee percentage (the upper boundary) and must be accepted.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_default_fee(&admin, &100u32);
+    assert_eq!(client.get_platform_fee(&admin), 100u32);
+}
+
+#[test]
+#[should_panic(expected = "fee percentage cannot exceed 100")]
+fn test_update_default_fee_rejects_101_above_boundary() {
+    // 101% exceeds the maximum allowed and must panic before any state is written.
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.update_default_fee(&admin, &101u32);
 }
 
 // ============================================================
