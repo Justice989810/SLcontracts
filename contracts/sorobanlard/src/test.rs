@@ -14643,3 +14643,4 @@ fn test_course_certificates_index_grows_per_issuance() {
 }
 
 mod issues_346;
+mod issues_349;
